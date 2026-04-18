@@ -8420,7 +8420,3 @@ if __name__ == '__main__':
     for i in range(0,len(test_eval_df.columns),4): print(test_eval_df.iloc[:, i:i+4])
 
     model.generate_texts(code_graphs=test_data['code_graphs'], text_dic=test_data['text_dic'], res_path=res_path, gold_texts=test_data['texts'], raw_data=test_raw_data, token_data=test_token_data)
-    
-    
-    
-    print('Done.')
