@@ -157,8 +157,8 @@
 # seeds=[0,42,7,23,124,1084,87]
 # seed_torch(seeds[0])
 
-#跳跃知识网络
-#coding=utf-8
+# 跳跃知识网络
+# coding=utf-8
 # import logging
 # import os
 # import sys
@@ -314,11 +314,12 @@
 # seeds=[0,42,7,23,124,1084,87]
 # seed_torch(seeds[0])
 
-#双轨
+# 超图原生双流分化读出 (Hypergraph-Native Bifurcation Readout, HNBR)
 #coding=utf-8
 import logging
 import os
 import sys
+import math
 sys.path.append('../../../')
 from lib.util.eval.translate_metric import get_nltk33_sent_bleu1 as get_sent_bleu1, \
                                               get_nltk33_sent_bleu2 as get_sent_bleu2,  \
@@ -327,7 +328,6 @@ from lib.util.eval.translate_metric import get_nltk33_sent_bleu1 as get_sent_ble
                                             get_nltk33_sent_bleu as get_sent_bleu
 from lib.util.eval.translate_metric import get_corp_bleu1,get_corp_bleu2,get_corp_bleu3,get_corp_bleu4,get_corp_bleu
 from lib.util.eval.translate_metric import get_meteor,get_rouge,get_cider
-import math
 
 train_data_name='train_data'
 valid_data_name='valid_data'
@@ -361,16 +361,15 @@ PAD_TOKEN='<pad>'
 UNK_TOKEN='<unk>'
 
 model_dir=os.path.join(top_data_dir,'model/')
-os.environ["CUDA_VISIBLE_DEVICES"] ="1" 
+os.environ["CUDA_VISIBLE_DEVICES"] ="1,2" 
+from torch_geometric.nn import SAGEConv
 
-# ================= 核心超参数配置 ================= 
 emb_dims = 512  
-graph_gnn_layers = 4  # 宏观超图轨深度
-micro_gnn_layers = 2  # 微观词法轨深度 (保持浅层，防止平滑)
+graph_gnn_layers = 6  # 恢复你高阶超图的 6 层深度！
 text_att_layers = 8    
-train_batch_size = 100#恢复你之前的 Batch 64
+train_batch_size = 128 # 配合累加保证显存安全
 
-version = '13_HDT_DualTrack_SOTA'  
+version = '15_PureHypergraph_Bifurcation_SOTA'  
 model_name = 'codescriber_v{}_{}_{}_{}'.format(version, graph_gnn_layers, text_att_layers, emb_dims)
 
 params = dict(
@@ -379,12 +378,12 @@ params = dict(
     model_id=None,
     emb_dims=emb_dims,
     graph_gnn_layers=graph_gnn_layers, 
-    micro_gnn_layers=micro_gnn_layers,
+    graph_GNN=SAGEConv,
+    graph_gnn_aggr='mean', # 防止超图多边相加导致数值爆炸，必须用 mean
     text_att_layers=text_att_layers,
     text_att_heads=8,
     text_att_head_dims=None,
     text_ff_hid_dims=4 * emb_dims,
-    
     drop_rate=0.2,  
     copy=True,
     pad_idx=0,
@@ -404,9 +403,19 @@ params = dict(
     gpu_ids=os.environ["CUDA_VISIBLE_DEVICES"],
     train_mode=True,
 
-    # ================= 【重构：异构双轨网络】 ================= 
-    # 彻底解耦超图的语义泛化和Copy机制的词法精确定位
-    use_hdt_dual_track=True,
+    # ================= 【你的核心创新点 100% 保留】 ================= 
+    # 1. 论文核心：有向超图注意力
+    use_directed_hyperedges=True,
+    
+    # 2. 论文核心：动态语义超边
+    use_dynamic_edges=True,
+    dynamic_threshold=0.85, 
+
+    # 3. 论文核心：超边位置感知
+    use_hyperedge_pos_emb=True,  
+
+    # 4. 【破局大招】：超图双流分化读出 (Bifurcation Readout)
+    use_bifurcation_readout=True,
     
     use_cl=True,
     cl_weight=0.05,        
