@@ -314,7 +314,7 @@
 # seeds=[0,42,7,23,124,1084,87]
 # seed_torch(seeds[0])
 
-# 超图原生双流分化读出 (Hypergraph-Native Bifurcation Readout, HNBR)
+#绝对原生词法高速公路 (Absolute Raw Lexical Highway, ARLH)
 #coding=utf-8
 import logging
 import os
@@ -361,15 +361,18 @@ PAD_TOKEN='<pad>'
 UNK_TOKEN='<unk>'
 
 model_dir=os.path.join(top_data_dir,'model/')
-os.environ["CUDA_VISIBLE_DEVICES"] ="1,2" 
+os.environ["CUDA_VISIBLE_DEVICES"] ="1" 
 from torch_geometric.nn import SAGEConv
 
+# ================= 核心超参数配置 ================= 
 emb_dims = 512  
-graph_gnn_layers = 6  # 恢复你高阶超图的 6 层深度！
+graph_gnn_layers = 6  # 保持你高阶超图的 6 层深度！
 text_att_layers = 8    
-train_batch_size = 128 # 配合累加保证显存安全
 
-version = '15_PureHypergraph_Bifurcation_SOTA'  
+# 恢复中小 Batch，防止 Copy 机制的梯度在庞大 Batch 中被磨平
+train_batch_size = 64 
+
+version = '16_PureHypergraph_ARLH_SOTA'  
 model_name = 'codescriber_v{}_{}_{}_{}'.format(version, graph_gnn_layers, text_att_layers, emb_dims)
 
 params = dict(
@@ -379,7 +382,7 @@ params = dict(
     emb_dims=emb_dims,
     graph_gnn_layers=graph_gnn_layers, 
     graph_GNN=SAGEConv,
-    graph_gnn_aggr='mean', # 防止超图多边相加导致数值爆炸，必须用 mean
+    graph_gnn_aggr='mean', 
     text_att_layers=text_att_layers,
     text_att_heads=8,
     text_att_head_dims=None,
@@ -404,18 +407,15 @@ params = dict(
     train_mode=True,
 
     # ================= 【你的核心创新点 100% 保留】 ================= 
-    # 1. 论文核心：有向超图注意力
     use_directed_hyperedges=True,
-    
-    # 2. 论文核心：动态语义超边
     use_dynamic_edges=True,
     dynamic_threshold=0.85, 
-
-    # 3. 论文核心：超边位置感知
     use_hyperedge_pos_emb=True,  
 
-    # 4. 【破局大招】：超图双流分化读出 (Bifurcation Readout)
-    use_bifurcation_readout=True,
+    # ================= 【破局杀招】 ================= 
+    # 绝对原生词法高速公路 (Absolute Raw Lexical Highway)
+    # 将 Copy 机制彻底剥离出 GNN，赋予其最尖锐的点积匹配能力！
+    use_arlh=True,
     
     use_cl=True,
     cl_weight=0.05,        

@@ -7956,7 +7956,8 @@
 
 
 
-#超图原生双流分化读出 (Hypergraph-Native Bifurcation Readout, HNBR)
+#绝对原生词法高速公路 (Absolute Raw Lexical Highway, ARLH)
+
 # coding=utf-8
 import os
 import re
@@ -8110,11 +8111,9 @@ class Datasetx(Dataset):
         data['node'].src_map = torch.tensor(cg['node2text_map_ids']).long()
         data['node'].code_mask = torch.tensor(cg['code_node_mask']).bool()
         
-        # 所有超边装载
         for key in ['parent_child_hyperedges', 'line_hyperedges', 'block_hyperedges', 'layout_sibling_hyperedges', 'dfg_hyperedges']:
             if key in cg and len(cg[key]) > 0: data['node', key, 'node'].edge_index = torch.tensor(cg[key], dtype=torch.long)
 
-        # 把 AST 和 DFG 转换为超边关联矩阵供 DHGAT 使用 (完美原生超图！)
         ast_s, ast_d = build_directed_hyperedges_from_simple(cg.get('base_father2child_edges', []), 'src')
         if ast_s.size > 0:
             data['node', 'ast_dir_s', 'node'].edge_index, data['node', 'ast_dir_d', 'node'].edge_index = torch.tensor(ast_s).long(), torch.tensor(ast_d).long()
@@ -8130,7 +8129,7 @@ class Datasetx(Dataset):
         return data
     def __len__(self): return self.len
 
-# ================= 3. 核心网络：全超图架构 + 分化读出 =================
+# ================= 3. 核心网络：纯血超图 + ARLH 降维打击 =================
 class CodeGraphEnc(nn.Module):
     def __init__(self, emb_dims, graph_max_size, code_max_len, graph_node_emb_op, graph_gnn_layers=6, drop_rate=0.2, **kwargs):
         super().__init__()
@@ -8139,7 +8138,10 @@ class CodeGraphEnc(nn.Module):
         self.use_hyperedge_pos_emb = kwargs.get('use_hyperedge_pos_emb', True)
         self.use_directed_hyperedges = kwargs.get('use_directed_hyperedges', True)
         self.use_dynamic_edges = kwargs.get('use_dynamic_edges', True)
-        self.use_bifurcation_readout = kwargs.get('use_bifurcation_readout', True)
+        
+        # 降维打击开关
+        self.use_arlh = kwargs.get('use_arlh', True)
+        
         self.dynamic_threshold = kwargs.get('dynamic_threshold', 0.85)
         self.gnn_layers = graph_gnn_layers
 
@@ -8152,12 +8154,11 @@ class CodeGraphEnc(nn.Module):
         self.hetero_alpha = nn.Parameter(torch.ones(graph_gnn_layers, 8))
         
         for _ in range(graph_gnn_layers):
-            # 完全围绕你的核心代码，没有任何简单图污染
             self.gnn_ops.append(HeteroConv({
                 ('node', 'block_hyperedges', 'node'): HyperedgeDiffusionConv(emb_dims, emb_dims, K=1),
                 ('node', 'line_hyperedges', 'node'): HyperedgeDiffusionConv(emb_dims, emb_dims, K=1),
                 ('node', 'layout_sibling_hyperedges', 'node'): HyperedgeDiffusionConv(emb_dims, emb_dims, K=1),
-                ('node', 'parent_child_hyperedges', 'node'): HyperedgeDiffusionConv(emb_dims, emb_dims, K=3),
+                ('node', 'parent_child_hyperedges', 'node'): HyperedgeDiffusionConv(emb_dims, emb_dims, K=1),
                 ('node', 'dfg_hyperedges', 'node'): HyperedgeDiffusionConv(emb_dims, emb_dims, K=1),
                 ('node', 'dynamic_semantic_hyperedges', 'node'): HyperedgeDiffusionConv(emb_dims, emb_dims, K=1)
             }, aggr='mean'))
@@ -8168,11 +8169,6 @@ class CodeGraphEnc(nn.Module):
             }))
             self.grelu_ops.append(nn.Sequential(nn.ReLU(), nn.Dropout(p=drop_rate)))
             self.gnorm_ops.append(GraphNorm(emb_dims))
-            
-        # 【破局核心】：分化读出层。拼接 0~6 层所有特征，为 Copy 雷达提供超高分辨率！
-        if self.use_bifurcation_readout:
-            self.bifurcation_proj = nn.Linear(emb_dims * (graph_gnn_layers + 1), emb_dims)
-            self.bifurcation_norm = nn.LayerNorm(emb_dims)
 
     def _add_dynamic_edges(self, data):
         dense_x, mask = to_dense_batch(data['node'].x, data.x_batch_dict['node'], fill_value=0.0) 
@@ -8197,9 +8193,13 @@ class CodeGraphEnc(nn.Module):
         
         data['node'].x = self.emb_drop_op(graph_node_emb) 
         
-        # 记录超图漫游的每一步历史
-        history_x = [data['node'].x.clone()]
+        # =========================================================
+        # 【核心绝杀】：绝对原生词法高速公路 (ARLH)
+        # 在进入任何超图算子之前，将纯血的 Token Embedding 克隆下来！
+        # =========================================================
+        x_raw_lexical = data['node'].x.clone()
         
+        # 你的超图继续大展宏图，去深层捕捉全局逻辑
         for i, (gnn, dhgat, relu, norm) in enumerate(zip(self.gnn_ops, self.dhgat_ops, self.grelu_ops, self.gnorm_ops)):
             if self.use_dynamic_edges and i == (self.gnn_layers // 2): self._add_dynamic_edges(data)
             
@@ -8216,26 +8216,20 @@ class CodeGraphEnc(nn.Module):
                     out_x = out_x + self.hetero_alpha[i, 5] * dhgat['dfg_dir'](x_input, d_s, d_d)
 
             data['node'].x = norm(x_input + relu(out_x))
-            history_x.append(data['node'].x)
 
-        # =========================================================
-        # 【致胜代码】：语义与词法原生分流读出 (Bifurcation Readout)
-        # =========================================================
-        # 1. 语义流：直接取超图最后一层，供 Transformer 理解宏观代码结构
-        x_semantic = history_x[-1] 
+        x_deep_semantic = data['node'].x 
         
-        # 2. 词法流：拼接 0~6 层所有特征（包含绝对纯净的第 0 层），完美对齐空间后供给 Copy
-        if self.use_bifurcation_readout:
-            x_lexical = self.bifurcation_norm(self.bifurcation_proj(torch.cat(history_x, dim=-1)))
-        else:
-            x_lexical = x_semantic
-
-        graph_enc,_ = to_dense_batch(x_semantic, batch=data.x_batch_dict['node'], fill_value=self.pad_idx, max_num_nodes=self.graph_max_size, batch_size=batch_size)  
+        # 1. 语义流：包含宏大代码意图的深层特征
+        graph_enc,_ = to_dense_batch(x_deep_semantic, batch=data.x_batch_dict['node'], fill_value=self.pad_idx, max_num_nodes=self.graph_max_size, batch_size=batch_size)  
         
         cm = data['node'].code_mask; cb = data.x_batch_dict['node'][cm]
         code_src_map,_ = to_dense_batch(data.src_map_dict['node'][cm], batch=cb, fill_value=self.pad_idx, max_num_nodes=self.code_max_len, batch_size=batch_size)    
-        # 专供 Copy 的微观词法特征被成功保护！
-        graph_code_enc,_ = to_dense_batch(x_lexical[cm], batch=cb, fill_value=self.pad_idx, max_num_nodes=self.code_max_len, batch_size=batch_size)    
+        
+        # 2. 词法流：直接使用 ARLH 高速公路传来的 0 污染特征！
+        if self.use_arlh:
+            graph_code_enc,_ = to_dense_batch(x_raw_lexical[cm], batch=cb, fill_value=self.pad_idx, max_num_nodes=self.code_max_len, batch_size=batch_size)
+        else:
+            graph_code_enc,_ = to_dense_batch(x_deep_semantic[cm], batch=cb, fill_value=self.pad_idx, max_num_nodes=self.code_max_len, batch_size=batch_size)    
         
         return graph_enc, graph_code_enc, code_src_map
 
@@ -8258,9 +8252,11 @@ class Dec(nn.Module):
         text_emb = self.text_emb_op(text_input) * np.sqrt(self.emb_dims)
         text_dec = self.emb_layer_norm(self.dropout(text_emb.add(self.pos_encoding(text_input))))  
         
+        # Transformer 用全局语义 (graph_enc) 推理意图
         text_dec = self.text_dec_op(query=text_dec, key=graph_enc, query_mask=text_input.abs().sign(), key_mask=graph_enc.abs().sum(-1).sign())
         
         if not self._copy: return self.out_fc(text_dec).transpose(1, 2)
+        # Copy 机制用原生词法 (graph_code_enc) 精准复制
         return self.copy_generator(text_dec, graph_code_enc, code_src_map).transpose(1, 2)
 
 class TNet(BaseNet):
@@ -8295,7 +8291,7 @@ class TNet(BaseNet):
         return self.dec_op(g_enc, g_code, src_m, text_in)
 
 class TModel(TransSeq2Seq):
-    def __init__(self, model_dir, model_name='Transformer_based_model', model_id=None, emb_dims=512, graph_gnn_layers=6, graph_GNN=SAGEConv, graph_gnn_aggr='mean', text_att_layers=8, text_att_heads=8, text_att_head_dims=None, text_ff_hid_dims=2048, drop_rate=0.2, copy=True, pad_idx=0, train_batch_size=64, pred_batch_size=64, max_train_size=-1, max_valid_size=32 * 10, max_big_epochs=100, regular_rate=1e-5, lr_base=0.0005, lr_decay=0.95, min_lr_rate=0.01, warm_big_epochs=4, start_valid_epoch=60, early_stop=12, Net=TNet, Dataset=Datasetx, beam_width=5, train_metrics=[get_sent_bleu], valid_metric=get_sent_bleu, test_metrics=[get_sent_bleu], train_mode=True, **kwargs):
+    def __init__(self, model_dir, model_name='Transformer_based_model', model_id=None, emb_dims=512, graph_gnn_layers=6, graph_GNN=SAGEConv, graph_gnn_aggr='mean', text_att_layers=8, text_att_heads=8, text_att_head_dims=None, text_ff_hid_dims=2048, drop_rate=0.2, copy=True, pad_idx=0, train_batch_size=32, pred_batch_size=48, max_train_size=-1, max_valid_size=32 * 10, max_big_epochs=100, regular_rate=1e-5, lr_base=0.0005, lr_decay=0.95, min_lr_rate=0.01, warm_big_epochs=4, start_valid_epoch=60, early_stop=12, Net=TNet, Dataset=Datasetx, beam_width=5, train_metrics=[get_sent_bleu], valid_metric=get_sent_bleu, test_metrics=[get_sent_bleu], train_mode=True, **kwargs):
         logging.info('Construct %s' % model_name)
         super().__init__(model_name=model_name, model_dir=model_dir, model_id=model_id)
         self.init_params = locals()
@@ -8306,7 +8302,7 @@ class TModel(TransSeq2Seq):
         self.lr_base, self.lr_decay, self.min_lr_rate, self.warm_big_epochs, self.start_valid_epoch, self.early_stop = lr_base, lr_decay, min_lr_rate, warm_big_epochs, start_valid_epoch, early_stop
         self.Net, self.Dataset, self.beam_width, self.train_metrics, self.valid_metric, self.test_metrics, self.train_mode = Net, Dataset, beam_width, train_metrics, valid_metric, test_metrics, train_mode
         
-        self.use_bifurcation_readout = kwargs.get('use_bifurcation_readout', True)
+        self.use_arlh = kwargs.get('use_arlh', True)
         self.use_directed_hyperedges = kwargs.get('use_directed_hyperedges', True)
         self.use_hyperedge_pos_emb = kwargs.get('use_hyperedge_pos_emb', True)
         self.use_dynamic_edges = kwargs.get('use_dynamic_edges', True)
@@ -8331,7 +8327,7 @@ class TModel(TransSeq2Seq):
             emb_dims=self.emb_dims, graph_max_size=self.graph_max_size, code_max_len=self.code_max_len, text_max_len=self.text_max_len, io_voc_size=self.io_voc_size, text_voc_size=self.text_voc_size, graph_gnn_layers=self.graph_gnn_layers, graph_GNN=self.graph_GNN, graph_gnn_aggr=self.graph_gnn_aggr,
             text_att_layers=self.text_att_layers, text_att_heads=self.text_att_heads, text_att_head_dims=self.text_att_head_dims, text_ff_hid_dims=self.text_ff_hid_dims, 
             drop_rate=self.drop_rate, pad_idx=self.pad_idx, copy=self.copy, 
-            use_bifurcation_readout=self.use_bifurcation_readout, use_hyperedge_pos_emb=self.use_hyperedge_pos_emb, use_directed_hyperedges=self.use_directed_hyperedges, 
+            use_arlh=self.use_arlh, use_hyperedge_pos_emb=self.use_hyperedge_pos_emb, use_directed_hyperedges=self.use_directed_hyperedges, 
             use_dynamic_edges=self.use_dynamic_edges, use_cl=self.use_cl, cl_weight=self.cl_weight, cl_temp=self.cl_temp, edge_drop_rate=self.edge_drop_rate, dynamic_threshold=self.dynamic_threshold
         )
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  
@@ -8353,7 +8349,7 @@ class TModel(TransSeq2Seq):
         self.scheduler = LrWarmUp(self.optimizer, min_rate=self.min_lr_rate, lr_decay=self.lr_decay, warm_steps=self.warm_big_epochs * len(train_loader), reduce_steps=len(train_loader))  
         
         if self.train_mode:  
-            accumulation_steps = 1
+            accumulation_steps = 2
             for i in range(0, self.max_big_epochs):
                 pbar = tqdm(train_loader)
                 self.optimizer.zero_grad() 
@@ -8450,7 +8446,7 @@ class TModel(TransSeq2Seq):
         return text_tokens
 
 if __name__ == '__main__':
-    params.setdefault('use_bifurcation_readout', True)
+    params.setdefault('use_arlh', True)
     params.setdefault('use_directed_hyperedges', True) 
     params.setdefault('use_hyperedge_pos_emb', True)
     params.setdefault('use_dynamic_edges', True)
@@ -8487,7 +8483,7 @@ if __name__ == '__main__':
                    early_stop=params['early_stop'],
                    start_valid_epoch=params['start_valid_epoch'],
                    
-                   use_bifurcation_readout=params['use_bifurcation_readout'],
+                   use_arlh=params['use_arlh'],
                    use_directed_hyperedges=params['use_directed_hyperedges'],
                    use_hyperedge_pos_emb=params['use_hyperedge_pos_emb'],
                    use_dynamic_edges=params['use_dynamic_edges'],
