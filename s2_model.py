@@ -7956,8 +7956,7 @@
 
 
 
-#绝对原生词法高速公路 (Absolute Raw Lexical Highway, ARLH)
-
+# 重整化群理论
 # coding=utf-8
 import os
 import re
@@ -7997,90 +7996,35 @@ from torch_geometric.utils import to_dense_batch
 from torch_geometric.data.storage import (BaseStorage, NodeStorage,EdgeStorage)
 from torch_geometric.nn.data_parallel import DataParallel
 
-from torch_geometric.nn import HeteroConv, GraphNorm
-from torch_scatter import scatter, scatter_add
-from torch_geometric.utils import softmax as scatter_softmax
-from torch_geometric.utils import degree
+from torch_geometric.nn import HeteroConv, GraphNorm, GATConv, HypergraphConv
+from torch_scatter import scatter_mean
 
 logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.INFO)
 NodeOrEdgeStorage = Union[NodeStorage, EdgeStorage]
 
-# ================= 1. 你的核心算子 (完全保留 K阶扩散 & DHGAT) =================
-class HyperedgeDiffusionConv(nn.Module):
-    def __init__(self, in_channels, out_channels, K=1, alpha=0.5, bias=True):
-        super(HyperedgeDiffusionConv, self).__init__()
-        self.K = K
-        self._alpha_init = alpha
-        self.alpha = nn.Parameter(torch.tensor(alpha, dtype=torch.float32))
-        self.lin = nn.Linear(in_channels, out_channels, bias=bias)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        self.lin.reset_parameters()
-        if hasattr(self, 'alpha'): self.alpha.data.fill_(self._alpha_init)
-
-    def forward(self, x, hyperedge_index, num_nodes=None, num_edges=None):
-        if num_nodes is None: num_nodes = x.size(0)
-        if num_edges is None: num_edges = int(hyperedge_index[1].max()) + 1
-        node_idx, edge_idx = hyperedge_index
-
-        d_v = degree(node_idx, num_nodes, dtype=x.dtype).clamp_(min=1.0)
-        d_e = degree(edge_idx, num_edges, dtype=x.dtype).clamp_(min=1.0)
-        d_v_inv_sqrt = d_v.pow(-0.5)
-        d_e_inv = d_e.pow(-1.0) 
-        d_v_norm_term = d_v.pow(-1.0)[node_idx] 
-
-        x = self.lin(x)
-        x_temp = x * d_v_inv_sqrt.unsqueeze(-1)
-        H_e = scatter_add(x_temp[node_idx], edge_idx, dim=0, dim_size=num_edges) * d_e_inv.unsqueeze(-1)
-        H_e_0 = H_e 
-
-        cur_alpha = torch.clamp(self.alpha, min=0.0, max=1.0)
-        for k in range(self.K):
-            H_node_temp = H_e[edge_idx] * d_v_norm_term.unsqueeze(-1)
-            H_e_diffused = scatter_add(H_node_temp, edge_idx, dim=0, dim_size=num_edges) * d_e_inv.unsqueeze(-1)
-            H_e = (1 - cur_alpha) * H_e_diffused + cur_alpha * H_e_0
-
-        out = scatter_add(H_e[edge_idx], node_idx, dim=0, dim_size=num_nodes) * d_v_inv_sqrt.unsqueeze(-1)
-        return out
-
-def build_directed_hyperedges_from_simple(edges, group_by='src'):
-    if edges is None or np.size(edges) == 0:
-        return np.empty((2, 0), dtype=np.int64), np.empty((2, 0), dtype=np.int64)
-    src_nodes, dst_nodes = np.array(edges[0]), np.array(edges[1])
-    src_hyper_edges, dst_hyper_edges = [], []
-    if group_by == 'src':
-        for h_id, src in enumerate(np.unique(src_nodes)):
-            src_hyper_edges.append([src, h_id])
-            for child in dst_nodes[src_nodes == src]: dst_hyper_edges.append([child, h_id])  
-    else:
-        for h_id, dst in enumerate(np.unique(dst_nodes)):
-            dst_hyper_edges.append([dst, h_id])
-            for parent in src_nodes[dst_nodes == dst]: src_hyper_edges.append([parent, h_id])
-    return np.array(src_hyper_edges, dtype=np.int64).T, np.array(dst_hyper_edges, dtype=np.int64).T
-
-class DirectedHypergraphAttention(nn.Module):
-    def __init__(self, emb_dims):
+# ================= 1. 原位粗粒化算子 (RG-Flow) =================
+class RGCoarseGraining(nn.Module):
+    def __init__(self, emb_dims, dropout=0.2):
         super().__init__()
-        self.att_src = nn.Linear(emb_dims, 1, bias=False)
-        self.att_dst = nn.Linear(emb_dims, 1, bias=False)
-        self.leaky_relu = nn.LeakyReLU(0.2)
-        self.out_proj = nn.Linear(emb_dims, emb_dims, bias=False)
+        self.transform = nn.Sequential(
+            nn.Linear(emb_dims, emb_dims),
+            nn.LayerNorm(emb_dims),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        self.res_gate = nn.Linear(emb_dims * 2, emb_dims)
 
-    def forward(self, x, edge_index_src, edge_index_dst):
-        if edge_index_src.numel() == 0: return torch.zeros_like(x)
-        src_nodes, src_edges = edge_index_src[0], edge_index_src[1]
-        dst_nodes, dst_edges = edge_index_dst[0], edge_index_dst[1]
-        num_he = max(src_edges.max().item(), dst_edges.max().item()) + 1
-        
-        alpha_src = scatter_softmax(self.leaky_relu(self.att_src(x[src_nodes])), src_edges, dim=0)
-        he_x = scatter(x[src_nodes] * alpha_src, src_edges, dim=0, dim_size=num_he, reduce='sum')
-        
-        alpha_dst = scatter_softmax(self.leaky_relu(self.att_dst(he_x[dst_edges] + x[dst_nodes])), dst_nodes, dim=0)
-        out = scatter(he_x[dst_edges] * alpha_dst, dst_nodes, dim=0, dim_size=x.size(0), reduce='sum')
-        return self.out_proj(out)
+    def forward(self, x, hyperedge_index):
+        if hyperedge_index is None or hyperedge_index.numel() == 0:
+            return x
+        node_idx, cluster_idx = hyperedge_index[0], hyperedge_index[1]
+        cluster_repr = scatter_mean(x[node_idx], cluster_idx, dim=0)
+        cluster_repr = self.transform(cluster_repr)
+        macro_field = scatter_mean(cluster_repr[cluster_idx], node_idx, dim=0, dim_size=x.size(0))
+        gate = torch.sigmoid(self.res_gate(torch.cat([x, macro_field], dim=-1)))
+        return gate * x + (1 - gate) * macro_field
 
-# ================= 2. 数据预处理 =================
+# ================= 2. 数据处理与边界提取 =================
 class Datax(HeteroData):
     def __cat_dim__(self, key: str, value: Any, store: Optional[NodeOrEdgeStorage] = None, *args, **kwargs) -> Any:
         if bool(re.search('(token)', key)): return None  
@@ -8111,15 +8055,16 @@ class Datasetx(Dataset):
         data['node'].src_map = torch.tensor(cg['node2text_map_ids']).long()
         data['node'].code_mask = torch.tensor(cg['code_node_mask']).bool()
         
-        for key in ['parent_child_hyperedges', 'line_hyperedges', 'block_hyperedges', 'layout_sibling_hyperedges', 'dfg_hyperedges']:
-            if key in cg and len(cg[key]) > 0: data['node', key, 'node'].edge_index = torch.tensor(cg[key], dtype=torch.long)
-
-        ast_s, ast_d = build_directed_hyperedges_from_simple(cg.get('base_father2child_edges', []), 'src')
-        if ast_s.size > 0:
-            data['node', 'ast_dir_s', 'node'].edge_index, data['node', 'ast_dir_d', 'node'].edge_index = torch.tensor(ast_s).long(), torch.tensor(ast_d).long()
-        dfg_s, dfg_d = build_directed_hyperedges_from_simple(cg.get('dfg_prev2next_edges', []), 'dst')
-        if dfg_s.size > 0:
-            data['node', 'dfg_dir_s', 'node'].edge_index, data['node', 'dfg_dir_d', 'node'].edge_index = torch.tensor(dfg_s).long(), torch.tensor(dfg_d).long()
+        edges_to_load = [
+            'code_prev2next_edges', 'code_next2prev_edges', 
+            'dfg_prev2next_edges', 'dfg_next2prev_edges',
+            'line_hyperedges', 'cfg_prev2next_edges', 'cfg_next2prev_edges',
+            'block_hyperedges', 'base_child2father_edges', 'base_father2child_edges',
+            'parent_child_hyperedges', 'layout_sibling_hyperedges'
+        ]
+        for key in edges_to_load:
+            if key in cg and len(cg[key]) > 0:
+                data['node', key, 'node'].edge_index = torch.tensor(cg[key], dtype=torch.long)
 
         data['text'].text_token_input = torch.tensor(pad_text_in).long()
         if self.texts is not None: data['text'].text_token_output = torch.tensor(pad_text_out).long()
@@ -8129,189 +8074,150 @@ class Datasetx(Dataset):
         return data
     def __len__(self): return self.len
 
-# ================= 3. 核心网络：纯血超图 + ARLH 降维打击 =================
-class CodeGraphEnc(nn.Module):
-    def __init__(self, emb_dims, graph_max_size, code_max_len, graph_node_emb_op, graph_gnn_layers=6, drop_rate=0.2, **kwargs):
+# ================= 3. RG-CodeNet 时序分阶编码器 =================
+class PhasedRGCodeNetEnc(nn.Module):
+    def __init__(self, emb_dims, graph_max_size, code_max_len, graph_node_emb_op, drop_rate=0.2, **kwargs):
         super().__init__()
-        self.graph_max_size, self.code_max_len, self.emb_dims = graph_max_size, code_max_len, emb_dims
+        self.emb_dims, self.graph_max_size, self.code_max_len = emb_dims, graph_max_size, code_max_len
         self.pad_idx = kwargs.get('pad_idx', 0)
-        self.use_hyperedge_pos_emb = kwargs.get('use_hyperedge_pos_emb', True)
-        self.use_directed_hyperedges = kwargs.get('use_directed_hyperedges', True)
-        self.use_dynamic_edges = kwargs.get('use_dynamic_edges', True)
+        self.node_emb = graph_node_emb_op
+        self.pos_enc = nn.Embedding(graph_max_size * 2 + 1, emb_dims, padding_idx=self.pad_idx)
+        self.drop = nn.Dropout(drop_rate)
         
-        # 降维打击开关
-        self.use_arlh = kwargs.get('use_arlh', True)
-        
-        self.dynamic_threshold = kwargs.get('dynamic_threshold', 0.85)
-        self.gnn_layers = graph_gnn_layers
+        # 阶段 1：微观 (Token + 数据流)
+        self.micro_convs = nn.ModuleList([HeteroConv({
+            ('node', 'code_prev2next_edges', 'node'): GATConv(emb_dims, emb_dims//4, heads=4, concat=True, add_self_loops=False),
+            ('node', 'dfg_prev2next_edges', 'node'): GATConv(emb_dims, emb_dims//4, heads=4, concat=True, add_self_loops=False)
+        }, aggr='mean') for _ in range(2)])
+        self.micro_norms = nn.ModuleList([GraphNorm(emb_dims) for _ in range(2)])
 
-        self.graph_node_emb_op = graph_node_emb_op
-        self.graph_pos_encoding = nn.Embedding(graph_max_size * 2 + 1, emb_dims, padding_idx=self.pad_idx)
-        nn.init.xavier_uniform_(self.graph_pos_encoding.weight[1:, ])
-        self.emb_drop_op = nn.Dropout(p=drop_rate)
-        
-        self.gnn_ops, self.dhgat_ops, self.gnorm_ops, self.grelu_ops = nn.ModuleList(), nn.ModuleList(), nn.ModuleList(), nn.ModuleList()
-        self.hetero_alpha = nn.Parameter(torch.ones(graph_gnn_layers, 8))
-        
-        for _ in range(graph_gnn_layers):
-            self.gnn_ops.append(HeteroConv({
-                ('node', 'block_hyperedges', 'node'): HyperedgeDiffusionConv(emb_dims, emb_dims, K=1),
-                ('node', 'line_hyperedges', 'node'): HyperedgeDiffusionConv(emb_dims, emb_dims, K=1),
-                ('node', 'layout_sibling_hyperedges', 'node'): HyperedgeDiffusionConv(emb_dims, emb_dims, K=1),
-                ('node', 'parent_child_hyperedges', 'node'): HyperedgeDiffusionConv(emb_dims, emb_dims, K=1),
-                ('node', 'dfg_hyperedges', 'node'): HyperedgeDiffusionConv(emb_dims, emb_dims, K=1),
-                ('node', 'dynamic_semantic_hyperedges', 'node'): HyperedgeDiffusionConv(emb_dims, emb_dims, K=1)
-            }, aggr='mean'))
-            
-            self.dhgat_ops.append(nn.ModuleDict({
-                'ast_dir': DirectedHypergraphAttention(emb_dims),
-                'dfg_dir': DirectedHypergraphAttention(emb_dims)
-            }))
-            self.grelu_ops.append(nn.Sequential(nn.ReLU(), nn.Dropout(p=drop_rate)))
-            self.gnorm_ops.append(GraphNorm(emb_dims))
+        # 阶段 2：向上粗粒化 (AST 融合)
+        self.to_line = RGCoarseGraining(emb_dims, drop_rate)
+        self.upward_convs = nn.ModuleList([HeteroConv({
+            ('node', 'base_child2father_edges', 'node'): GATConv(emb_dims, emb_dims//4, heads=4, concat=True, add_self_loops=False),
+            ('node', 'parent_child_hyperedges', 'node'): HypergraphConv(emb_dims, emb_dims, use_attention=False, dropout=drop_rate),
+            ('node', 'line_hyperedges', 'node'): HypergraphConv(emb_dims, emb_dims, use_attention=False, dropout=drop_rate)
+        }, aggr='mean') for _ in range(2)])
+        self.upward_norms = nn.ModuleList([GraphNorm(emb_dims) for _ in range(2)])
 
-    def _add_dynamic_edges(self, data):
-        dense_x, mask = to_dense_batch(data['node'].x, data.x_batch_dict['node'], fill_value=0.0) 
-        sim_matrix = torch.bmm(F.normalize(dense_x, p=2, dim=-1), F.normalize(dense_x, p=2, dim=-1).transpose(1, 2)) 
-        sim_matrix.diagonal(dim1=1, dim2=2).fill_(-1.0)
-        adj = (sim_matrix > self.dynamic_threshold) & (mask.unsqueeze(1) & mask.unsqueeze(2))
-        b_idx, r, c = adj.nonzero(as_tuple=True)
-        flat = torch.zeros_like(mask, dtype=torch.long); flat[mask] = torch.arange(mask.sum(), device=mask.device)
-        data.edge_index_dict[('node', 'dynamic_semantic_hyperedges', 'node')] = torch.stack([flat[b_idx, r], flat[b_idx, c]], dim=0)
+        # 阶段 3：宏观环流 (提取意图)
+        self.to_block = RGCoarseGraining(emb_dims, drop_rate)
+        self.macro_convs = nn.ModuleList([HeteroConv({
+            ('node', 'cfg_prev2next_edges', 'node'): GATConv(emb_dims, emb_dims//4, heads=4, concat=True, add_self_loops=False),
+            ('node', 'block_hyperedges', 'node'): HypergraphConv(emb_dims, emb_dims, use_attention=False, dropout=drop_rate),
+            ('node', 'layout_sibling_hyperedges', 'node'): HypergraphConv(emb_dims, emb_dims, use_attention=False, dropout=drop_rate)
+        }, aggr='mean') for _ in range(2)])
+        self.macro_norms = nn.ModuleList([GraphNorm(emb_dims) for _ in range(2)])
+        
+        self.copy_norm = nn.LayerNorm(emb_dims)
 
     def forward(self, data):
-        graph_node_emb = self.graph_node_emb_op(data.x_dict['node']) * np.sqrt(self.emb_dims)
+        x = self.node_emb(data.x_dict['node']) * math.sqrt(self.emb_dims)
         batch_size = data.x_batch_dict['node'].max().item() + 1
         pos_indices_list = []
         for b in range(batch_size):
             num = (data.x_batch_dict['node'] == b).sum().item()
-            max_p = self.graph_pos_encoding.num_embeddings - 1
-            pos_indices_list.append((torch.arange(1, num + 1, device=graph_node_emb.device) % max_p) + 1)
-        
-        if self.use_hyperedge_pos_emb: 
-            graph_node_emb = graph_node_emb + self.graph_pos_encoding(torch.cat(pos_indices_list)) 
-        
-        data['node'].x = self.emb_drop_op(graph_node_emb) 
-        
-        # =========================================================
-        # 【核心绝杀】：绝对原生词法高速公路 (ARLH)
-        # 在进入任何超图算子之前，将纯血的 Token Embedding 克隆下来！
-        # =========================================================
-        x_raw_lexical = data['node'].x.clone()
-        
-        # 你的超图继续大展宏图，去深层捕捉全局逻辑
-        for i, (gnn, dhgat, relu, norm) in enumerate(zip(self.gnn_ops, self.dhgat_ops, self.grelu_ops, self.gnorm_ops)):
-            if self.use_dynamic_edges and i == (self.gnn_layers // 2): self._add_dynamic_edges(data)
-            
-            x_input = data['node'].x
-            x_dict = gnn(x_dict=data.x_dict, edge_index_dict=data.edge_index_dict)
-            out_x = x_dict.get('node', torch.zeros_like(x_input))
-            
-            if self.use_directed_hyperedges:
-                a_s, a_d = data.edge_index_dict.get(('node','ast_dir_s','node')), data.edge_index_dict.get(('node','ast_dir_d','node'))
-                if a_s is not None and a_s.numel() > 0: 
-                    out_x = out_x + self.hetero_alpha[i, 4] * dhgat['ast_dir'](x_input, a_s, a_d)
-                d_s, d_d = data.edge_index_dict.get(('node','dfg_dir_s','node')), data.edge_index_dict.get(('node','dfg_dir_d','node'))
-                if d_s is not None and d_s.numel() > 0: 
-                    out_x = out_x + self.hetero_alpha[i, 5] * dhgat['dfg_dir'](x_input, d_s, d_d)
+            pos_indices_list.append((torch.arange(1, num + 1, device=x.device) % (self.pos_enc.num_embeddings - 1)) + 1)
+        x = x + self.pos_enc(torch.cat(pos_indices_list)); x = self.drop(x)
 
-            data['node'].x = norm(x_input + relu(out_x))
+        # 1. 微观阶段: 保留完美词法快照
+        for conv, norm in zip(self.micro_convs, self.micro_norms):
+            micro_edges = {k: v for k, v in data.edge_index_dict.items() if k[1] in ['code_prev2next_edges', 'dfg_prev2next_edges']}
+            if micro_edges:
+                out = conv(x_dict={'node': x}, edge_index_dict=micro_edges)
+                if 'node' in out: x = norm(x + F.relu(out['node']))
+        x_lexical_copy = self.copy_norm(x.clone())
 
-        x_deep_semantic = data['node'].x 
-        
-        # 1. 语义流：包含宏大代码意图的深层特征
-        graph_enc,_ = to_dense_batch(x_deep_semantic, batch=data.x_batch_dict['node'], fill_value=self.pad_idx, max_num_nodes=self.graph_max_size, batch_size=batch_size)  
-        
+        # 2. 向上重整化: 融合进入 AST 结构
+        x = self.to_line(x, data.edge_index_dict.get(('node', 'line_hyperedges', 'node')))
+        for conv, norm in zip(self.upward_convs, self.upward_norms):
+            up_edges = {k: v for k, v in data.edge_index_dict.items() if k[1] in ['base_child2father_edges', 'parent_child_hyperedges', 'line_hyperedges']}
+            if up_edges:
+                out = conv(x_dict={'node': x}, edge_index_dict=up_edges)
+                if 'node' in out: x = norm(x + F.relu(out['node']))
+
+        # 3. 宏观阶段: 全局控制流演化
+        x = self.to_block(x, data.edge_index_dict.get(('node', 'block_hyperedges', 'node')))
+        for conv, norm in zip(self.macro_convs, self.macro_norms):
+            macro_edges = {k: v for k, v in data.edge_index_dict.items() if k[1] in ['cfg_prev2next_edges', 'block_hyperedges', 'layout_sibling_hyperedges']}
+            if macro_edges:
+                out = conv(x_dict={'node': x}, edge_index_dict=macro_edges)
+                if 'node' in out: x = norm(x + F.relu(out['node']))
+
+        x_semantic_macro = x
+
+        graph_enc, _ = to_dense_batch(x_semantic_macro, batch=data.x_batch_dict['node'], fill_value=self.pad_idx, max_num_nodes=self.graph_max_size, batch_size=batch_size)  
         cm = data['node'].code_mask; cb = data.x_batch_dict['node'][cm]
-        code_src_map,_ = to_dense_batch(data.src_map_dict['node'][cm], batch=cb, fill_value=self.pad_idx, max_num_nodes=self.code_max_len, batch_size=batch_size)    
-        
-        # 2. 词法流：直接使用 ARLH 高速公路传来的 0 污染特征！
-        if self.use_arlh:
-            graph_code_enc,_ = to_dense_batch(x_raw_lexical[cm], batch=cb, fill_value=self.pad_idx, max_num_nodes=self.code_max_len, batch_size=batch_size)
-        else:
-            graph_code_enc,_ = to_dense_batch(x_deep_semantic[cm], batch=cb, fill_value=self.pad_idx, max_num_nodes=self.code_max_len, batch_size=batch_size)    
+        code_src_map, _ = to_dense_batch(data.src_map_dict['node'][cm], batch=cb, fill_value=self.pad_idx, max_num_nodes=self.code_max_len, batch_size=batch_size)    
+        graph_code_enc, _ = to_dense_batch(x_lexical_copy[cm], batch=cb, fill_value=self.pad_idx, max_num_nodes=self.code_max_len, batch_size=batch_size)    
         
         return graph_enc, graph_code_enc, code_src_map
 
 class Dec(nn.Module):
-    def __init__(self, emb_dims, text_voc_size, text_emb_op, text_max_len, enc_out_dims, att_layers, att_heads, att_head_dims=None, ff_hid_dims=2048, drop_rate=0., **kwargs):
+    def __init__(self, emb_dims, text_voc_size, text_emb_op, text_max_len, enc_out_dims, **kwargs):
         super().__init__()
         self.emb_dims = emb_dims
         self._copy = kwargs.get('copy', True)
+        pad_idx = kwargs.get('pad_idx', 0)
+        drop_rate = kwargs.get('drop_rate', 0.2)
         
         self.text_emb_op = text_emb_op
-        self.pos_encoding = PosEnc(max_len=text_max_len+1, emb_dims=emb_dims, train=True, pad=True, pad_idx=kwargs.get('pad_idx', 0)) 
+        self.pos_encoding = PosEnc(max_len=text_max_len+1, emb_dims=emb_dims, train=True, pad=True, pad_idx=pad_idx) 
         self.emb_layer_norm = nn.LayerNorm(emb_dims)
         
-        self.text_dec_op = TranDec(query_dims=emb_dims, key_dims=enc_out_dims, head_nums=att_heads, head_dims=att_head_dims, layer_num=att_layers, ff_hid_dims=ff_hid_dims, drop_rate=drop_rate, pad_idx=kwargs.get('pad_idx', 0), self_causality=True)
+        self.text_dec_op = TranDec(query_dims=emb_dims, key_dims=enc_out_dims, head_nums=kwargs.get('text_att_heads', 8), head_dims=kwargs.get('text_att_head_dims', None), layer_num=kwargs.get('text_att_layers', 8), ff_hid_dims=kwargs.get('text_ff_hid_dims', 2048), drop_rate=drop_rate, pad_idx=pad_idx, self_causality=True)
         self.dropout = nn.Dropout(p=drop_rate)
         self.out_fc = nn.Linear(emb_dims, text_voc_size)
-        self.copy_generator = MultiCopyGenerator(tgt_dims=emb_dims, tgt_voc_size=text_voc_size, src_dims=enc_out_dims, att_heads=att_heads, att_head_dims=att_head_dims, drop_rate=drop_rate, pad_idx=kwargs.get('pad_idx', 0))
+        self.copy_generator = MultiCopyGenerator(tgt_dims=emb_dims, tgt_voc_size=text_voc_size, src_dims=enc_out_dims, att_heads=kwargs.get('text_att_heads', 8), att_head_dims=kwargs.get('text_att_head_dims', None), drop_rate=drop_rate, pad_idx=pad_idx)
 
     def forward(self, graph_enc, graph_code_enc, code_src_map, text_input):
         text_emb = self.text_emb_op(text_input) * np.sqrt(self.emb_dims)
         text_dec = self.emb_layer_norm(self.dropout(text_emb.add(self.pos_encoding(text_input))))  
-        
-        # Transformer 用全局语义 (graph_enc) 推理意图
         text_dec = self.text_dec_op(query=text_dec, key=graph_enc, query_mask=text_input.abs().sign(), key_mask=graph_enc.abs().sum(-1).sign())
-        
         if not self._copy: return self.out_fc(text_dec).transpose(1, 2)
-        # Copy 机制用原生词法 (graph_code_enc) 精准复制
         return self.copy_generator(text_dec, graph_code_enc, code_src_map).transpose(1, 2)
 
 class TNet(BaseNet):
-    def __init__(self, emb_dims, graph_max_size, code_max_len, text_max_len, io_voc_size, text_voc_size, graph_gnn_layers=6, drop_rate=0.2, **kwargs):
+    def __init__(self, emb_dims, graph_max_size, code_max_len, text_max_len, io_voc_size, text_voc_size, **kwargs):
         super().__init__()
-        self.use_cl, self.cl_temp, self.edge_drop_rate = kwargs.get('use_cl',True), kwargs.get('cl_temp',0.1), kwargs.get('edge_drop_rate',0.15)
-        io_emb = nn.Embedding(io_voc_size, emb_dims, padding_idx=kwargs.get('pad_idx',0)); nn.init.xavier_uniform_(io_emb.weight[1:, ])
-        self.enc_op = CodeGraphEnc(emb_dims, graph_max_size, code_max_len, io_emb, graph_gnn_layers, drop_rate, **kwargs)
-        self.dec_op = Dec(emb_dims, text_voc_size, io_emb, text_max_len, emb_dims, kwargs.get('text_att_layers',8), kwargs.get('text_att_heads',8), ff_hid_dims=kwargs.get('text_ff_hid_dims',2048), drop_rate=drop_rate, **kwargs)
+        # 安全传参隔离
+        safe_kwargs = deepcopy(kwargs)
+        for key in ['emb_dims', 'graph_max_size', 'code_max_len', 'text_max_len', 'io_voc_size', 'text_voc_size', 'graph_node_emb_op']:
+            safe_kwargs.pop(key, None)
 
-    def augment(self, data):
-        aug = deepcopy(data)
-        for et in aug.edge_index_dict.keys():
-            idx = aug.edge_index_dict[et]
-            if idx.numel() > 0: aug.edge_index_dict[et] = idx[:, torch.rand(idx.size(1), device=idx.device) > self.edge_drop_rate]
-        return aug
+        self.use_cl = safe_kwargs.get('use_cl', True)
+        self.cl_temp = safe_kwargs.get('cl_temp', 0.1)
+        io_emb = nn.Embedding(io_voc_size, emb_dims, padding_idx=safe_kwargs.get('pad_idx', 0))
+        nn.init.xavier_uniform_(io_emb.weight[1:, ])
+        
+        self.enc_op = PhasedRGCodeNetEnc(emb_dims, graph_max_size, code_max_len, io_emb, **safe_kwargs)
+        self.dec_op = Dec(emb_dims, text_voc_size, io_emb, text_max_len, emb_dims, **safe_kwargs)
+
+    def _cal_cl_loss(self, x):
+        z = F.normalize(x.mean(1), p=2, dim=-1)
+        sim = torch.matmul(z, z.T) / self.cl_temp
+        return F.cross_entropy(sim, torch.arange(z.size(0), device=z.device))
 
     def forward(self, data):
-        text_in = data['text'].text_token_input.clone()
-        del data['text']
+        text_in = data['text'].text_token_input.clone(); del data['text']
         if self.training and self.use_cl:
-            cg_orig, cg_aug = deepcopy(data), self.augment(data)
-            g_enc, g_code, src_m = self.enc_op(cg_orig)
-            g_enc_a, _, _ = self.enc_op(cg_aug)
+            g_enc, g_code, src_m = self.enc_op(data)
             out = self.dec_op(g_enc, g_code, src_m, text_in)
-            z1, z2 = F.normalize(g_enc.mean(1), p=2, dim=-1), F.normalize(g_enc_a.mean(1), p=2, dim=-1)
-            sim = torch.matmul(z1, z2.T) / self.cl_temp
-            loss_cl = (F.cross_entropy(sim, torch.arange(z1.size(0), device=z1.device)) + F.cross_entropy(sim.T, torch.arange(z1.size(0), device=z1.device))) / 2
+            loss_cl = self._cal_cl_loss(g_enc)
             return out, loss_cl
-        
         g_enc, g_code, src_m = self.enc_op(data)
         return self.dec_op(g_enc, g_code, src_m, text_in)
 
 class TModel(TransSeq2Seq):
-    def __init__(self, model_dir, model_name='Transformer_based_model', model_id=None, emb_dims=512, graph_gnn_layers=6, graph_GNN=SAGEConv, graph_gnn_aggr='mean', text_att_layers=8, text_att_heads=8, text_att_head_dims=None, text_ff_hid_dims=2048, drop_rate=0.2, copy=True, pad_idx=0, train_batch_size=32, pred_batch_size=48, max_train_size=-1, max_valid_size=32 * 10, max_big_epochs=100, regular_rate=1e-5, lr_base=0.0005, lr_decay=0.95, min_lr_rate=0.01, warm_big_epochs=4, start_valid_epoch=60, early_stop=12, Net=TNet, Dataset=Datasetx, beam_width=5, train_metrics=[get_sent_bleu], valid_metric=get_sent_bleu, test_metrics=[get_sent_bleu], train_mode=True, **kwargs):
-        logging.info('Construct %s' % model_name)
-        super().__init__(model_name=model_name, model_dir=model_dir, model_id=model_id)
-        self.init_params = locals()
-        self.emb_dims, self.graph_gnn_layers, self.graph_GNN, self.graph_gnn_aggr = emb_dims, graph_gnn_layers, graph_GNN, graph_gnn_aggr
-        self.text_att_layers, self.text_att_heads, self.text_att_head_dims, self.text_ff_hid_dims = text_att_layers, text_att_heads, text_att_head_dims, text_ff_hid_dims
-        self.drop_rate, self.pad_idx, self.copy, self.train_batch_size, self.pred_batch_size = drop_rate, pad_idx, copy, train_batch_size, pred_batch_size
-        self.max_train_size, self.max_valid_size, self.max_big_epochs, self.regular_rate = max_train_size, max_valid_size, max_big_epochs, regular_rate
-        self.lr_base, self.lr_decay, self.min_lr_rate, self.warm_big_epochs, self.start_valid_epoch, self.early_stop = lr_base, lr_decay, min_lr_rate, warm_big_epochs, start_valid_epoch, early_stop
-        self.Net, self.Dataset, self.beam_width, self.train_metrics, self.valid_metric, self.test_metrics, self.train_mode = Net, Dataset, beam_width, train_metrics, valid_metric, test_metrics, train_mode
-        
-        self.use_arlh = kwargs.get('use_arlh', True)
-        self.use_directed_hyperedges = kwargs.get('use_directed_hyperedges', True)
-        self.use_hyperedge_pos_emb = kwargs.get('use_hyperedge_pos_emb', True)
-        self.use_dynamic_edges = kwargs.get('use_dynamic_edges', True)
-        self.use_cl = kwargs.get('use_cl', True)
-        self.cl_weight, self.cl_temp, self.edge_drop_rate, self.dynamic_threshold = kwargs.get('cl_weight', 0.05), kwargs.get('cl_temp', 0.1), kwargs.get('edge_drop_rate', 0.15), kwargs.get('dynamic_threshold', 0.85)
+    def __init__(self, **kwargs):
+        super().__init__(model_name=kwargs.get('model_name'), model_dir=kwargs.get('model_dir'), model_id=kwargs.get('model_id'))
+        self.params = kwargs
+        for k, v in kwargs.items(): setattr(self, k, v)
 
     def _logging_paramerter_num(self):
         logging.info("{} have {} paramerters in total".format(self.model_name, sum( x.numel() for x in self.net.parameters() if x.requires_grad)))
 
+    # ================= 完全对齐基线的 fit 模块与日志输出 =================
     def fit(self, train_data, valid_data, **kwargs):
         self.graph_max_size, self.code_max_len, self.io_voc_size, self.text_max_len=0, 0, 0, 0
         for code_graph,text in zip(train_data['code_graphs'],train_data['texts']):
@@ -8319,68 +8225,73 @@ class TModel(TransSeq2Seq):
             self.code_max_len = max(self.code_max_len,code_graph['code_node_mask'].sum())
             self.io_voc_size = max(self.io_voc_size,max(code_graph['nodes']))
             self.text_max_len=max(self.text_max_len,len(text))
-        self.io_voc_size+=1
-        self.text_voc_size = len(train_data['text_dic']['text_i2w']) 
-        self.io_voc_size=max(self.io_voc_size,self.text_voc_size+2*self.code_max_len)
+        self.io_voc_size = max(self.io_voc_size + 1, len(train_data['text_dic']['text_i2w']) + 2*self.code_max_len)
         
-        net = self.Net(
-            emb_dims=self.emb_dims, graph_max_size=self.graph_max_size, code_max_len=self.code_max_len, text_max_len=self.text_max_len, io_voc_size=self.io_voc_size, text_voc_size=self.text_voc_size, graph_gnn_layers=self.graph_gnn_layers, graph_GNN=self.graph_GNN, graph_gnn_aggr=self.graph_gnn_aggr,
-            text_att_layers=self.text_att_layers, text_att_heads=self.text_att_heads, text_att_head_dims=self.text_att_head_dims, text_ff_hid_dims=self.text_ff_hid_dims, 
-            drop_rate=self.drop_rate, pad_idx=self.pad_idx, copy=self.copy, 
-            use_arlh=self.use_arlh, use_hyperedge_pos_emb=self.use_hyperedge_pos_emb, use_directed_hyperedges=self.use_directed_hyperedges, 
-            use_dynamic_edges=self.use_dynamic_edges, use_cl=self.use_cl, cl_weight=self.cl_weight, cl_temp=self.cl_temp, edge_drop_rate=self.edge_drop_rate, dynamic_threshold=self.dynamic_threshold
-        )
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  
-        self.net =DataParallel(net.to(device),follow_batch=['x'])  
+        net_kwargs = deepcopy(self.params)
+        for key in ['emb_dims', 'graph_max_size', 'code_max_len', 'text_max_len', 'io_voc_size', 'text_voc_size']:
+            net_kwargs.pop(key, None)
+
+        net = TNet(emb_dims=self.emb_dims, graph_max_size=self.graph_max_size, code_max_len=self.code_max_len, text_max_len=self.text_max_len, io_voc_size=self.io_voc_size, text_voc_size=len(train_data['text_dic']['text_i2w']), **net_kwargs)
+        
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.net = DataParallel(net.to(device), follow_batch=['x'])  
         self._logging_paramerter_num()  
-        self.net.train()  
+        self.net.train()
 
         self.optimizer = optim.Adam(self.net.parameters(), lr=self.lr_base, weight_decay=self.regular_rate)
         self.criterion = LabelSmoothSoftmaxCEV2(reduction='mean', ignore_index=self.pad_idx, label_smooth=0.0)
-        self.text_begin_idx, self.text_end_idx = self.text_voc_size - 1, self.text_voc_size - 2
+        self.text_begin_idx, self.text_end_idx = len(train_data['text_dic']['text_i2w']) - 1, len(train_data['text_dic']['text_i2w']) - 2
         self.tgt_begin_idx, self.tgt_end_idx = self.text_begin_idx, self.text_end_idx
 
-        self.max_train_size = len(train_data['code_graphs']) if self.max_train_size == -1 else self.max_train_size
-        train_code_graphs, train_texts,train_ids = zip(*random.sample(list(zip(train_data['code_graphs'], train_data['texts'],train_data['ids'])), min(self.max_train_size, len(train_data['code_graphs']))))
-        train_set = self.Dataset(code_graphs=train_code_graphs, texts=train_texts, ids=train_ids, text_max_len=self.text_max_len, text_begin_idx=self.text_begin_idx, text_end_idx=self.text_end_idx, pad_idx=self.pad_idx)
-        train_loader=DataListLoader(dataset=train_set, batch_size=self.train_batch_size, shuffle=True, drop_last=True) 
-
-        if self.warm_big_epochs is None: self.warm_big_epochs = max(self.max_big_epochs // 10, 2)
-        self.scheduler = LrWarmUp(self.optimizer, min_rate=self.min_lr_rate, lr_decay=self.lr_decay, warm_steps=self.warm_big_epochs * len(train_loader), reduce_steps=len(train_loader))  
+        train_loader = DataListLoader(Datasetx(train_data['code_graphs'], train_data['texts'], train_data['ids'], self.text_max_len, self.text_begin_idx, self.text_end_idx, self.pad_idx), batch_size=self.train_batch_size, shuffle=True, drop_last=True)
         
-        if self.train_mode:  
+        if self.warm_big_epochs is None: self.warm_big_epochs = max(self.max_big_epochs // 10, 2)
+        self.scheduler = LrWarmUp(self.optimizer, min_rate=self.min_lr_rate, lr_decay=self.lr_decay, warm_steps=self.warm_big_epochs * len(train_loader), reduce_steps=len(train_loader))
+
+        if getattr(self, 'train_mode', True):
             accumulation_steps = 2
-            for i in range(0, self.max_big_epochs):
+            for i in range(self.max_big_epochs):
                 pbar = tqdm(train_loader)
-                self.optimizer.zero_grad() 
+                self.optimizer.zero_grad()
                 for j, batch_data in enumerate(pbar):
-                    batch_text_output, ids = [], []
+                    batch_text_output = []
+                    ids = []
                     for data in batch_data:
-                        batch_text_output.append(data['text'].text_token_output.unsqueeze(0)); ids.append(data['idx'].idx.item())
-                        del data['text'].text_token_output; del data['idx']
+                        batch_text_output.append(data['text'].text_token_output.unsqueeze(0))
+                        del data['text'].text_token_output
+                        ids.append(data['idx'].idx.item())
+                        del data['idx']
                     batch_text_output = torch.cat(batch_text_output, dim=0).to(device)
-                    
-                    if self.use_cl:
+
+                    if getattr(self, 'use_cl', True):
                         pred_text_output, loss_cl = self.net(batch_data)
                         loss_ce = self.criterion(pred_text_output, batch_text_output)
-                        loss = loss_ce + self.cl_weight * loss_cl.mean()
+                        loss = loss_ce + getattr(self, 'cl_weight', 0.05) * loss_cl.mean()
                     else:
                         pred_text_output = self.net(batch_data)
-                        loss_ce, loss = self.criterion(pred_text_output, batch_text_output), loss_ce
-                    
+                        loss = self.criterion(pred_text_output, batch_text_output)
+                        loss_ce = loss
+
                     (loss / accumulation_steps).backward()  
                     if (j + 1) % accumulation_steps == 0 or (j + 1) == len(train_loader):
-                        clip_grad_norm_(self.net.parameters(), 2.0); self.optimizer.step(); self.scheduler.step(); self.optimizer.zero_grad()
-
+                        clip_grad_norm_(self.net.parameters(), 2.0)
+                        self.optimizer.step()
+                        self.scheduler.step()
+                        self.optimizer.zero_grad()
+                    
+                    # 彻底对齐日志格式
                     text_dic = {'text_i2w': train_data['text_dic']['text_i2w'], 'ex_text_i2ws': [train_data['text_dic']['ex_text_i2ws'][k] for k in ids]}
-                    log_info=self._get_log_fit_eval(loss=loss_ce, pred_tgt=pred_text_output, gold_tgt=batch_text_output, tgt_i2w=text_dic)
-                    log_info = '[Big epoch:{}/{}, CE:{:.3f}, CL:{:.3f}, {}]'.format(i + 1, self.max_big_epochs, loss_ce.item(), loss_cl.mean().item(), log_info) if self.use_cl else '[Big epoch:{}/{},{}]'.format(i + 1, self.max_big_epochs, log_info)
+                    log_info = self._get_log_fit_eval(loss=loss_ce, pred_tgt=pred_text_output, gold_tgt=batch_text_output, tgt_i2w=text_dic)
+                    
+                    if getattr(self, 'use_cl', True):
+                        log_info = '[Big epoch:{}/{}, CL:{:.3f}, {}]'.format(i + 1, self.max_big_epochs, loss_cl.mean().item(), log_info)
+                    else:
+                        log_info = '[Big epoch:{}/{},{}]'.format(i + 1, self.max_big_epochs, log_info)
+                    
                     pbar.set_description(log_info)
                     del pred_text_output, batch_text_output, batch_data
                 
-                torch.cuda.empty_cache()
                 del pbar
-                
                 if i+1 >= self.start_valid_epoch:
                     self.max_valid_size = len(valid_data['code_graphs']) if self.max_valid_size == -1 else self.max_valid_size
                     valid_srcs, valid_tgts, ex_text_i2ws = zip(*random.sample(list(zip(valid_data['code_graphs'], valid_data['texts'], valid_data['text_dic']['ex_text_i2ws'])), min(self.max_valid_size, len(valid_data['code_graphs']))))
@@ -8389,9 +8300,9 @@ class TModel(TransSeq2Seq):
                     if worse_epochs>=self.early_stop: break
                     
         self._do_validation(valid_srcs=valid_data['code_graphs'], valid_tgts=valid_data['texts'], tgt_i2w=valid_data['text_dic'], increase_better=True, last=True)  
-        self._logging_paramerter_num()  
 
     def predict(self, code_graphs, text_dic):
+        logging.info('Predict outputs of %s' % self.model_name)
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  
         self.net.eval()  
         enc_op=DataParallel(self.net.module.enc_op,follow_batch=['x']); dec_op=torch.nn.DataParallel(self.net.module.dec_op)
@@ -8421,6 +8332,7 @@ class TModel(TransSeq2Seq):
         return self._tgt_ids2tokens(np.concatenate(pred_text_id_np_batches,axis=0), text_dic, self.text_end_idx)
     
     def generate_texts(self,code_graphs,text_dic,res_path,gold_texts,raw_data,token_data,**kwargs):
+        logging.info('>>>>>>>Generate the targets according to sources and save the result to {}'.format(res_path))
         kwargs.setdefault('beam_width',1)
         if not os.path.exists(os.path.dirname(res_path)): os.makedirs(os.path.dirname(res_path))
         pred_texts=self.predict(code_graphs=code_graphs, text_dic=text_dic)
@@ -8429,6 +8341,7 @@ class TModel(TransSeq2Seq):
         for i,(pred_text,gold_text,raw_item,token_item) in enumerate(zip(pred_texts,gold_texts,raw_data,token_data)):
             res_data.append(dict(pred_text=' '.join(pred_text), gold_text=' '.join(gold_text), sent_bleu=self.valid_metric([pred_text],[gold_text]), raw_code=raw_item['code'], raw_text=raw_item['text'], id=raw_item['id'], token_text=token_item['text'],))
         with codecs.open(res_path,'w',encoding='utf-8') as f: json.dump(res_data,f,indent=4, ensure_ascii=False)
+        logging.info('>>>>>>>The result has been saved to {}'.format(res_path))
 
     def _code_ids2tokens(self,code_idss, code_i2w, end_idx):
         return [[code_i2w[idx] for idx in (code_ids[:code_ids.tolist().index(end_idx)] if end_idx in code_ids else code_ids)] for code_ids in code_idss]
@@ -8445,59 +8358,18 @@ class TModel(TransSeq2Seq):
             text_tokens = [[text_i2w[idx] for idx in (text_ids[:text_ids.tolist().index(end_idx)] if end_idx in text_ids else text_ids)] for text_ids in text_id_np]
         return text_tokens
 
+# ================= 5. 主程序入口 =================
 if __name__ == '__main__':
-    params.setdefault('use_arlh', True)
-    params.setdefault('use_directed_hyperedges', True) 
-    params.setdefault('use_hyperedge_pos_emb', True)
-    params.setdefault('use_dynamic_edges', True)
-    params.setdefault('use_cl', True)
-    params.setdefault('cl_weight', 0.05)
-    params.setdefault('cl_temp', 0.1)
-    params.setdefault('edge_drop_rate', 0.15)
-
     logging.info('Parameters are listed below: \n'+'\n'.join(['{}: {}'.format(key,value) for key,value in params.items()]))
 
     model = TModel(
-                   model_dir=params['model_dir'],
-                   model_name=params['model_name'],
-                   model_id=params['model_id'],
-                   emb_dims=params['emb_dims'],
-                   graph_gnn_layers=params['graph_gnn_layers'],
-                   text_att_layers=params['text_att_layers'],
-                   text_att_heads=params['text_att_heads'],
-                   text_att_head_dims=params['text_att_head_dims'],
-                   text_ff_hid_dims=params['text_ff_hid_dims'],
-                   drop_rate=params['drop_rate'],
-                   copy=params['copy'],
-                   pad_idx=params['pad_idx'],
-                   train_batch_size=params['train_batch_size'],
-                   pred_batch_size=params['pred_batch_size'],
-                   max_train_size=params['max_train_size'],  
-                   max_valid_size=params['max_valid_size'],  
-                   max_big_epochs=params['max_big_epochs'],
-                   regular_rate=params['regular_rate'],
-                   lr_base=params['lr_base'],
-                   lr_decay=params['lr_decay'],
-                   min_lr_rate=params['min_lr_rate'],
-                   warm_big_epochs=params['warm_big_epochs'],
-                   early_stop=params['early_stop'],
-                   start_valid_epoch=params['start_valid_epoch'],
-                   
-                   use_arlh=params['use_arlh'],
-                   use_directed_hyperedges=params['use_directed_hyperedges'],
-                   use_hyperedge_pos_emb=params['use_hyperedge_pos_emb'],
-                   use_dynamic_edges=params['use_dynamic_edges'],
-                   use_cl=params['use_cl'],
-                   cl_weight=params['cl_weight'],
-                   cl_temp=params['cl_temp'],
-                   edge_drop_rate=params['edge_drop_rate'],
-                   Net=TNet,
-                   Dataset=Datasetx,
-                   beam_width=params['beam_width'],
-                   train_metrics=train_metrics,
-                   valid_metric=valid_metric,
-                   test_metrics=test_metrics,
-                   train_mode=params['train_mode'])
+        Net=TNet, 
+        Dataset=Datasetx, 
+        train_metrics=train_metrics,    # 补充训练指标
+        valid_metric=valid_metric,      # 补充验证指标
+        test_metrics=test_metrics,      # 补充测试指标
+        **params
+    )
 
     logging.info('Load data ...')
     with codecs.open(train_avail_data_path, 'rb') as f: train_data = pickle.load(f)

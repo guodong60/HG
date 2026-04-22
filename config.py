@@ -314,7 +314,7 @@
 # seeds=[0,42,7,23,124,1084,87]
 # seed_torch(seeds[0])
 
-#绝对原生词法高速公路 (Absolute Raw Lexical Highway, ARLH)
+#重整化群理论
 #coding=utf-8
 import logging
 import os
@@ -361,28 +361,21 @@ PAD_TOKEN='<pad>'
 UNK_TOKEN='<unk>'
 
 model_dir=os.path.join(top_data_dir,'model/')
-os.environ["CUDA_VISIBLE_DEVICES"] ="1" 
-from torch_geometric.nn import SAGEConv
+os.environ["CUDA_VISIBLE_DEVICES"] ="1,2" 
 
-# ================= 核心超参数配置 ================= 
+# ================= 核心模型参数 ================= 
 emb_dims = 512  
-graph_gnn_layers = 6  # 保持你高阶超图的 6 层深度！
 text_att_layers = 8    
+train_batch_size = 100  # 配合梯度累加
 
-# 恢复中小 Batch，防止 Copy 机制的梯度在庞大 Batch 中被磨平
-train_batch_size = 64 
-
-version = '16_PureHypergraph_ARLH_SOTA'  
-model_name = 'codescriber_v{}_{}_{}_{}'.format(version, graph_gnn_layers, text_att_layers, emb_dims)
+version = '21_Phased_RG_Flow_AST_Baseline_Aligned'  
+model_name = 'codescriber_v{}_{}_{}'.format(version, text_att_layers, emb_dims)
 
 params = dict(
     model_dir=model_dir,
     model_name=model_name,
     model_id=None,
     emb_dims=emb_dims,
-    graph_gnn_layers=graph_gnn_layers, 
-    graph_GNN=SAGEConv,
-    graph_gnn_aggr='mean', 
     text_att_layers=text_att_layers,
     text_att_heads=8,
     text_att_head_dims=None,
@@ -391,7 +384,7 @@ params = dict(
     copy=True,
     pad_idx=0,
     train_batch_size=train_batch_size,
-    pred_batch_size=math.ceil(train_batch_size * 1.5), 
+    pred_batch_size=48, 
     max_train_size=-1,  
     max_valid_size=-1,  
     max_big_epochs=100,  
@@ -406,17 +399,10 @@ params = dict(
     gpu_ids=os.environ["CUDA_VISIBLE_DEVICES"],
     train_mode=True,
 
-    # ================= 【你的核心创新点 100% 保留】 ================= 
-    use_directed_hyperedges=True,
-    use_dynamic_edges=True,
-    dynamic_threshold=0.85, 
+    # ================= 【重整化群(RG)理论引擎开关】 ================= 
+    use_phased_rg_flow=True, 
     use_hyperedge_pos_emb=True,  
 
-    # ================= 【破局杀招】 ================= 
-    # 绝对原生词法高速公路 (Absolute Raw Lexical Highway)
-    # 将 Copy 机制彻底剥离出 GNN，赋予其最尖锐的点积匹配能力！
-    use_arlh=True,
-    
     use_cl=True,
     cl_weight=0.05,        
     cl_temp=0.1,           
