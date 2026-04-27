@@ -8119,10 +8119,10 @@ class CodeGraphEnc(nn.Module):
         self.emb_drop_op = nn.Dropout(p=drop_rate)
         
         # =========================================================
-        # 核心创新：基于重整化群的尺度退耦 (Scale Decoupling)
+        # 终极形态：自适应重整化门控网络 (Adaptive RG-Bottleneck)
         # =========================================================
-        self.micro_layers = 3  # 前3层提取微观相关算符
-        self.macro_layers = graph_gnn_layers - self.micro_layers # 后3层流向宏观不动点
+        self.micro_layers = 2  # 【极度重要】严格限制为1层，保证词汇快照的绝对锐利！
+        self.macro_layers = graph_gnn_layers - self.micro_layers  # 剩余层做宏观坍缩
 
         self.micro_gnns = nn.ModuleList()
         self.micro_norms = nn.ModuleList()
@@ -8132,39 +8132,49 @@ class CodeGraphEnc(nn.Module):
         self.macro_norms = nn.ModuleList()
         self.macro_relus = nn.ModuleList()
 
-        # 1. 微观算子：仅包含 AST、序列和数据流，绝对不含超边，防止词汇特征被平滑！
+        # 【核心 1】：超图必须使用 'mean' 聚合，防止度（Degree）爆炸淹没基础特征
+        robust_aggr = 'sum'
+
+        # 1. 微观引擎：只用局部树结构和序列结构
         for _ in range(self.micro_layers):
             gnn = HeteroConv({
-                ('node', 'base_child', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=graph_gnn_aggr, root_weight=True),
-                ('node', 'base_father', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=graph_gnn_aggr, root_weight=False),
-                ('node', 'sibling_next', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=graph_gnn_aggr, root_weight=False),
-                ('node', 'sibling_prev', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=graph_gnn_aggr, root_weight=False),
-                ('node', 'dfg_next', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=graph_gnn_aggr, root_weight=False),
-                ('node', 'dfg_prev', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=graph_gnn_aggr, root_weight=False),
-                ('node', 'code_next', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=graph_gnn_aggr, root_weight=False),
-                ('node', 'code_prev', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=graph_gnn_aggr, root_weight=False),
+                ('node', 'base_child', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=robust_aggr, root_weight=True),
+                ('node', 'base_father', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=robust_aggr, root_weight=False),
+                ('node', 'sibling_next', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=robust_aggr, root_weight=False),
+                ('node', 'sibling_prev', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=robust_aggr, root_weight=False),
+                ('node', 'dfg_next', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=robust_aggr, root_weight=False),
+                ('node', 'dfg_prev', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=robust_aggr, root_weight=False),
+                ('node', 'code_next', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=robust_aggr, root_weight=False),
+                ('node', 'code_prev', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=robust_aggr, root_weight=False),
             }, aggr='sum')
             self.micro_gnns.append(gnn)
             self.micro_relus.append(nn.Sequential(nn.ReLU(), nn.Dropout(p=drop_rate)))
             self.micro_norms.append(GraphNorm(emb_dims))
 
-        # 2. 宏观算子（重整化粗粒化）：引入超边和控制流（CFG），允许特征疯狂坍缩混合！
+        # 2. 宏观引擎：开启超图，提取意图
         for _ in range(self.macro_layers):
             gnn = HeteroConv({
-                # 继承基础边保持连通性
-                ('node', 'base_child', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=graph_gnn_aggr, root_weight=True),
-                ('node', 'base_father', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=graph_gnn_aggr, root_weight=False),
-                ('node', 'cfg_next', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=graph_gnn_aggr, root_weight=False),
-                ('node', 'cfg_prev', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=graph_gnn_aggr, root_weight=False),
-                # 开启超边融合
-                ('node', 'parentparent_child_hyperedges', 'node'): HypergraphConv(emb_dims, emb_dims, aggr=graph_gnn_aggr),
-                ('node', 'line_hyperedges', 'node'): HypergraphConv(emb_dims, emb_dims, aggr=graph_gnn_aggr),
-                ('node', 'dfg_hyperedges', 'node'): HypergraphConv(emb_dims, emb_dims, aggr=graph_gnn_aggr),
-                ('node', 'layout_sibling_hyperedges', 'node'): HypergraphConv(emb_dims, emb_dims, aggr=graph_gnn_aggr),
+                ('node', 'base_child', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=robust_aggr, root_weight=True),
+                ('node', 'base_father', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=robust_aggr, root_weight=False),
+                ('node', 'cfg_next', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=robust_aggr, root_weight=False),
+                ('node', 'cfg_prev', 'node'): graph_GNN((emb_dims,emb_dims), emb_dims, aggr=robust_aggr, root_weight=False),
+                ('node', 'parentparent_child_hyperedges', 'node'): HypergraphConv(emb_dims, emb_dims, aggr=robust_aggr),
+                ('node', 'line_hyperedges', 'node'): HypergraphConv(emb_dims, emb_dims, aggr=robust_aggr),
+                ('node', 'dfg_hyperedges', 'node'): HypergraphConv(emb_dims, emb_dims, aggr=robust_aggr),
+                ('node', 'layout_sibling_hyperedges', 'node'): HypergraphConv(emb_dims, emb_dims, aggr=robust_aggr),
             }, aggr='sum')
             self.macro_gnns.append(gnn)
             self.macro_relus.append(nn.Sequential(nn.ReLU(), nn.Dropout(p=drop_rate)))
             self.macro_norms.append(GraphNorm(emb_dims))
+
+        # 【核心 2】：自适应节点信息瓶颈门控 (Adaptive Information Bottleneck Gate)
+        self.snapshot_gate = nn.Sequential(
+            nn.Linear(emb_dims * 2, emb_dims // 2),
+            nn.ReLU(),
+            nn.Linear(emb_dims // 2, 1),
+            nn.Sigmoid()  # 输出 0~1 的保留比例
+        )
+        self.final_norm = nn.LayerNorm(emb_dims)
 
     def forward(self, data):
         graph_node_emb = self.graph_node_emb_op(data.x_dict['node']) 
@@ -8192,10 +8202,9 @@ class CodeGraphEnc(nn.Module):
         code_x_batch = data.x_batch_dict['node'][data['node'].code_mask==True]
 
         # ===============================================
-        # 阶段 A：微观演化 (保留极致词法指纹)
+        # 阶段 A：微观演化 (保留极致词法快照)
         # ===============================================
         for gnn, relu, norm in zip(self.micro_gnns, self.micro_relus, self.micro_norms):
-            # 过滤出只供微观层使用的边
             micro_edges = {k: v for k, v in data.edge_index_dict.items() if k[1] in [
                 'base_child', 'base_father', 'sibling_next', 'sibling_prev', 
                 'dfg_next', 'dfg_prev', 'code_next', 'code_prev']}
@@ -8203,14 +8212,13 @@ class CodeGraphEnc(nn.Module):
             if 'node' in x_dict:
                 data['node'].x = norm(data['node'].x.add(relu(x_dict['node']))) 
         
-        # 👑 截取相关算符快照，专供 Copy！
+        # 🌟 永久封存微观快照
         micro_snapshot = data['node'].x.clone()
 
         # ===============================================
-        # 阶段 B：宏观坍缩 (超边引发全局语义融合)
+        # 阶段 B：宏观坍缩 (超图意图提取)
         # ===============================================
         for gnn, relu, norm in zip(self.macro_gnns, self.macro_relus, self.macro_norms):
-            # 过滤出宏观层使用的边（超边 + 控制流 + 基础树）
             macro_edges = {k: v for k, v in data.edge_index_dict.items() if k[1] in [
                 'base_child', 'base_father', 'cfg_next', 'cfg_prev',
                 'parentparent_child_hyperedges', 'line_hyperedges', 
@@ -8218,21 +8226,57 @@ class CodeGraphEnc(nn.Module):
             x_dict = gnn(x_dict=data.x_dict, edge_index_dict=macro_edges)
             if 'node' in x_dict:
                 data['node'].x = norm(data['node'].x.add(relu(x_dict['node']))) 
+        
+        macro_feature = data['node'].x
 
+        # # ===============================================
+        # # 阶段 C：自适应信息瓶颈融合 (决胜关键)
+        # # ===============================================
+        # # 网络自己计算每个节点应该保留多少微观身份（gate值趋近1代表保留，趋近0代表使用宏观）
+        # concat_features = torch.cat([micro_snapshot, macro_feature], dim=-1)
+        # gate = self.snapshot_gate(concat_features)  # [num_nodes, 1]
+        
+        # # 融合：智能退耦！Decoder 看到的不再是马赛克，而是核心词发光、噪音词被平滑的物理场。
+        # fused_semantic = gate * micro_snapshot + (1 - gate) * macro_feature
+        # fused_semantic = self.final_norm(fused_semantic)
+
+        # # ===============================================
+        # # 输出给下游
+        # # ===============================================
+        # graph_enc, _ = to_dense_batch(fused_semantic, # Decoder 看全局智能场
+        #                           batch=data.x_batch_dict['node'], 
+        #                           fill_value=self.pad_idx,
+        #                           max_num_nodes=self.graph_max_size)  
+
+        # code_src_map, _ = to_dense_batch(data.src_map_dict['node'][data['node'].code_mask==True],
+        #                                 batch=code_x_batch,  
+        #                                 fill_value=self.pad_idx,
+        #                                 max_num_nodes=self.code_max_len)    
+                                        
+        # graph_code_enc, _ = to_dense_batch(micro_snapshot[data['node'].code_mask==True], # Copy 依然看绝对纯净的快照
+        #                                 batch=code_x_batch,  
+        #                                 fill_value=self.pad_idx,
+        #                                 max_num_nodes=self.code_max_len)    
+
+        # return graph_enc, graph_code_enc, code_src_map
         # ===============================================
-        # 输出退耦：Transformer 用宏观，Copy 用微观
+        # 阶段 C：绝对正交输出 (去除门控，防止混合污染)
         # ===============================================
-        graph_enc, _ = to_dense_batch(data['node'].x, # <--- Transformer 用被超图揉碎的宏观意图
+        
+        # 仪器 1 (Transformer) 读取纯粹的宏观意图特征 macro_feature
+        graph_enc, _ = to_dense_batch(macro_feature, 
                                   batch=data.x_batch_dict['node'], 
                                   fill_value=self.pad_idx,
                                   max_num_nodes=self.graph_max_size)  
 
+        # 仪器 2 (Copy机制) 读取被保护的、含有兄弟上下文的微观特征 micro_snapshot
+        code_x_batch = data.x_batch_dict['node'][data['node'].code_mask==True]
         code_src_map, _ = to_dense_batch(data.src_map_dict['node'][data['node'].code_mask==True],
                                         batch=code_x_batch,  
                                         fill_value=self.pad_idx,
                                         max_num_nodes=self.code_max_len)    
                                         
-        graph_code_enc, _ = to_dense_batch(micro_snapshot[data['node'].code_mask==True], # <--- Copy 机制用超高清词汇快照
+        graph_code_enc, _ = to_dense_batch(micro_snapshot[data['node'].code_mask==True], 
                                         batch=code_x_batch,  
                                         fill_value=self.pad_idx,
                                         max_num_nodes=self.code_max_len)    
